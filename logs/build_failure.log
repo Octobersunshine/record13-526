@@ -1,0 +1,21 @@
+[2024-01-15 14:20:01] Starting CI pipeline #453
+[2024-01-15 14:20:02] Checking out repository: feature/auth branch
+[2024-01-15 14:20:05] Fetching dependencies...
+[2024-01-15 14:20:15] Downloading go modules...
+[2024-01-15 14:20:45] Dependencies resolved successfully
+[2024-01-15 14:20:46] Running lint checks...
+[2024-01-15 14:21:02] Lint: 3 warnings found (continuing)
+[2024-01-15 14:21:03] Running unit tests...
+[2024-01-15 14:21:30] --- PASS: TestUserLogin (0.12s)
+[2024-01-15 14:21:30] --- FAIL: TestTokenValidation (0.18s)
+[2024-01-15 14:21:30]        token_test.go:87: Expected token to be valid for 24h, got 1h
+[2024-01-15 14:21:30] --- PASS: TestDatabaseConnection (0.08s)
+[2024-01-15 14:21:31] Tests failed (128 tests, 1 failure)
+[2024-01-15 14:21:32] Building application...
+[2024-01-15 14:22:15] Compiling 235 source files...
+[2024-01-15 14:23:00] auth/token.go:145:12: undefined: GenerateRefreshToken
+[2024-01-15 14:23:00] auth/token.go:156:18: cannot use token (type string) as type *Token in assignment
+[2024-01-15 14:23:01] ❌ Build failed with 2 compilation errors
+[2024-01-15 14:23:01] 
+[2024-01-15 14:23:01] ERROR: Compilation failed, aborting pipeline
+[2024-01-15 14:23:02] Pipeline finished with exit code 1
