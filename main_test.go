@@ -421,3 +421,257 @@ func TestSingleLineFile(t *testing.T) {
 		t.Errorf("expected content %q, got %q", content, lines[0])
 	}
 }
+
+func TestClassifyErrorCompile(t *testing.T) {
+	tests := []struct {
+		line     string
+		expected ErrorCategory
+		matched  bool
+	}{
+		{"main.go:42:18: undefined: foo", ErrorCategoryCompile, true},
+		{"SyntaxError: unexpected token", ErrorCategoryCompile, true},
+		{"compilation failed with 3 errors", ErrorCategoryCompile, true},
+		{"error: cannot find module", ErrorCategoryCompile, true},
+		{"Build completed successfully", "", false},
+	}
+
+	for _, tt := range tests {
+		cat, matched := classifyError(tt.line)
+		if matched != tt.matched {
+			t.Errorf("classifyError(%q) matched=%v, expected %v", tt.line, matched, tt.matched)
+		}
+		if matched && cat != tt.expected {
+			t.Errorf("classifyError(%q) category=%s, expected %s", tt.line, cat, tt.expected)
+		}
+	}
+}
+
+func TestExtractErrorsCompile(t *testing.T) {
+	log := `Starting build...
+Compiling main.go...
+main.go:42:18: undefined: foo
+main.go:87:5: syntax error near '}'
+Running tests...
+All tests passed
+Build completed successfully`
+
+	lines := strings.Split(log, "\n")
+	errors, stats := extractErrors(lines, 50, nil)
+
+	if len(errors) != 2 {
+		t.Errorf("expected 2 errors, got %d", len(errors))
+	}
+
+	for _, e := range errors {
+		if e.Category != ErrorCategoryCompile {
+			t.Errorf("expected category %s, got %s", ErrorCategoryCompile, e.Category)
+		}
+		t.Logf("Error line %d: [%s] %s", e.Line, e.Category, e.Content)
+	}
+
+	if stats[ErrorCategoryCompile] != 2 {
+		t.Errorf("expected 2 compile errors in stats, got %d", stats[ErrorCategoryCompile])
+	}
+}
+
+func TestExtractErrorsMixedCategories(t *testing.T) {
+	log := `Building project...
+src/app.ts(15,10): error TS2304: Cannot find name 'user'
+npm ERR! could not resolve dependency
+Running tests...
+FAIL: TestLogin - expected 200 but got 500
+assertion failed in auth_test.go
+Deploying to production...
+Error: permission denied to deploy
+Error: unauthorized access to registry
+connection refused to database server
+invalid config file detected
+Build finished with errors`
+
+	lines := strings.Split(log, "\n")
+	errors, stats := extractErrors(lines, 100, nil)
+
+	t.Logf("Total errors found: %d", len(errors))
+	for _, e := range errors {
+		t.Logf("  Line %d [%s]: %s", e.Line, e.Category, e.Content)
+	}
+
+	t.Logf("Stats:")
+	for cat, count := range stats {
+		t.Logf("  %s: %d", cat, count)
+	}
+
+	if len(errors) < 5 {
+		t.Errorf("expected at least 5 errors, got %d", len(errors))
+	}
+
+	if stats[ErrorCategoryCompile] < 1 {
+		t.Error("expected at least 1 compile error")
+	}
+	if stats[ErrorCategoryTest] < 1 {
+		t.Error("expected at least 1 test error")
+	}
+	if stats[ErrorCategoryDeploy] < 1 {
+		t.Error("expected at least 1 deploy error")
+	}
+	if stats[ErrorCategoryDependency] < 1 {
+		t.Error("expected at least 1 dependency error")
+	}
+	if stats[ErrorCategoryConfig] < 1 {
+		t.Error("expected at least 1 config error")
+	}
+	if stats[ErrorCategoryNetwork] < 1 {
+		t.Error("expected at least 1 network error")
+	}
+}
+
+func TestExtractErrorsMaxErrorsLimit(t *testing.T) {
+	var logBuilder strings.Builder
+	for i := 0; i < 50; i++ {
+		logBuilder.WriteString(fmt.Sprintf("compilation error: module_%d.go build failed\n", i))
+	}
+
+	lines := strings.Split(strings.TrimRight(logBuilder.String(), "\n"), "\n")
+	maxErrors := 10
+	errors, stats := extractErrors(lines, maxErrors, nil)
+
+	if len(errors) != maxErrors {
+		t.Errorf("expected %d errors returned, got %d", maxErrors, len(errors))
+	}
+
+	totalInStats := 0
+	for _, count := range stats {
+		totalInStats += count
+	}
+	if totalInStats != 50 {
+		t.Errorf("expected 50 total errors in stats, got %d", totalInStats)
+	}
+
+	if stats[ErrorCategoryCompile] != 50 {
+		t.Errorf("expected 50 compile errors in stats, got %d", stats[ErrorCategoryCompile])
+	}
+}
+
+func TestExtractErrorsFilterByCategory(t *testing.T) {
+	log := `Building...
+main.go:1: error: syntax error
+Test failed
+permission denied
+connection timeout`
+
+	lines := strings.Split(log, "\n")
+
+	compileErrors, _ := extractErrors(lines, 100, []ErrorCategory{ErrorCategoryCompile})
+	if len(compileErrors) != 1 {
+		t.Errorf("expected 1 compile error, got %d", len(compileErrors))
+	}
+
+	testAndPermErrors, _ := extractErrors(lines, 100, []ErrorCategory{ErrorCategoryTest, ErrorCategoryPermission})
+	if len(testAndPermErrors) != 2 {
+		t.Errorf("expected 2 errors (test + permission), got %d", len(testAndPermErrors))
+	}
+}
+
+func TestParseCategoriesParam(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected int
+	}{
+		{"", 0},
+		{"compile", 1},
+		{"compile,test,deploy", 3},
+		{"compile, invalid, test", 2},
+		{"COMPILE, Test, DEPLOY", 3},
+		{"invalid,unknown", 0},
+	}
+
+	for _, tt := range tests {
+		result := parseCategoriesParam(tt.input)
+		if len(result) != tt.expected {
+			t.Errorf("parseCategoriesParam(%q) = %d categories, expected %d", tt.input, len(result), tt.expected)
+		}
+	}
+}
+
+func TestExtractErrorsFromFile(t *testing.T) {
+	path := "logs/build_failure.log"
+
+	lines, err := readTailLinesFromFile(path, DefaultMaxTailBytes, DefaultMaxTailLines)
+	if err != nil {
+		t.Fatalf("failed to read file: %v", err)
+	}
+
+	errors, stats := extractErrors(lines, 100, nil)
+
+	t.Logf("Errors found in build_failure.log: %d", len(errors))
+	for _, e := range errors {
+		t.Logf("  Line %d [%s]: %s", e.Line, e.Category, e.Content)
+	}
+	t.Logf("Stats:")
+	for cat, count := range stats {
+		t.Logf("  %s: %d", cat, count)
+	}
+
+	if len(errors) == 0 {
+		t.Error("expected at least some errors in build_failure.log")
+	}
+}
+
+func TestExtractErrorsRuntime(t *testing.T) {
+	log := `Starting service...
+panic: runtime error: invalid memory address or nil pointer dereference
+goroutine 1 [running]:
+fatal error: out of memory
+context deadline exceeded
+stack overflow detected`
+
+	lines := strings.Split(log, "\n")
+	errors, stats := extractErrors(lines, 50, nil)
+
+	for _, e := range errors {
+		t.Logf("Line %d [%s]: %s", e.Line, e.Category, e.Content)
+	}
+
+	if stats[ErrorCategoryRuntime] < 2 {
+		t.Errorf("expected at least 2 runtime errors, got %d", stats[ErrorCategoryRuntime])
+	}
+}
+
+func TestExtractErrorsConfig(t *testing.T) {
+	log := `Loading config...
+Error: invalid config file format
+yaml error: line 15: mapping values are not allowed
+missing required environment variable DB_HOST
+configuration validation failed`
+
+	lines := strings.Split(log, "\n")
+	errors, stats := extractErrors(lines, 50, nil)
+
+	for _, e := range errors {
+		t.Logf("Line %d [%s]: %s", e.Line, e.Category, e.Content)
+	}
+
+	if stats[ErrorCategoryConfig] < 2 {
+		t.Errorf("expected at least 2 config errors, got %d", stats[ErrorCategoryConfig])
+	}
+}
+
+func TestExtractErrorsFromSuccessLog(t *testing.T) {
+	path := "logs/build_success.log"
+
+	lines, err := readTailLinesFromFile(path, DefaultMaxTailBytes, DefaultMaxTailLines)
+	if err != nil {
+		t.Fatalf("failed to read file: %v", err)
+	}
+
+	errors, stats := extractErrors(lines, 100, nil)
+
+	t.Logf("Errors found in build_success.log: %d", len(errors))
+	for cat, count := range stats {
+		t.Logf("  %s: %d", cat, count)
+	}
+
+	if len(errors) > 5 {
+		t.Errorf("expected few errors in success log, got %d", len(errors))
+	}
+}
