@@ -41,6 +41,12 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
+const (
+	DefaultMaxTailBytes = 1 * 1024 * 1024
+	DefaultMaxTailLines = 2000
+	readBufferSize      = 64 * 1024
+)
+
 var successPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(build\s+success(ful)?|pipeline\s+success|job\s+success|deploy\s+success)\b`),
 	regexp.MustCompile(`(?i)\b(success|succeeded|passed)\b`),
@@ -130,7 +136,7 @@ func extractStatus(lines []string) (BuildStatus, string) {
 	}
 }
 
-func readLinesFromFile(path string) ([]string, error) {
+func readTailLinesFromFile(path string, maxBytes int64, maxLines int) ([]string, error) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("invalid file path: %w", err)
@@ -142,20 +148,57 @@ func readLinesFromFile(path string) ([]string, error) {
 	}
 	defer f.Close()
 
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+	fileInfo, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat file: %w", err)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
+
+	fileSize := fileInfo.Size()
+	if fileSize == 0 {
+		return []string{}, nil
+	}
+
+	readSize := maxBytes
+	if readSize > fileSize {
+		readSize = fileSize
+	}
+
+	startPos := fileSize - readSize
+
+	buf := make([]byte, readSize)
+	_, err = f.ReadAt(buf, startPos)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("failed to read file tail: %w", err)
+	}
+
+	if startPos > 0 {
+		firstNewline := -1
+		for i := 0; i < len(buf); i++ {
+			if buf[i] == '\n' {
+				firstNewline = i
+				break
+			}
+		}
+		if firstNewline >= 0 {
+			buf = buf[firstNewline+1:]
+		}
+	}
+
+	content := string(buf)
+	rawLines := strings.Split(content, "\n")
+	var lines []string
+	for _, line := range rawLines {
+		lines = append(lines, strings.TrimRight(line, "\r"))
+	}
+
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
 	}
 
 	return lines, nil
 }
 
-func readLinesFromURL(rawURL string) ([]string, error) {
+func readTailLinesFromURL(rawURL string, maxLines int) ([]string, error) {
 	parsedURL, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
@@ -174,19 +217,70 @@ func readLinesFromURL(rawURL string) ([]string, error) {
 		return nil, fmt.Errorf("unexpected HTTP status: %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+	ring := make([]string, maxLines)
+	writeIdx := 0
+	count := 0
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
+
+	for scanner.Scan() {
+		ring[writeIdx] = strings.TrimRight(scanner.Text(), "\r")
+		writeIdx = (writeIdx + 1) % maxLines
+		if count < maxLines {
+			count++
+		}
 	}
 
-	lines := strings.Split(string(body), "\n")
-	return lines, nil
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to stream response body: %w", err)
+	}
+
+	result := make([]string, count)
+	if count < maxLines {
+		copy(result, ring[:count])
+	} else {
+		copy(result, ring[writeIdx:])
+		copy(result[maxLines-writeIdx:], ring[:writeIdx])
+	}
+
+	return result, nil
+}
+
+func parseIntParam(s string, defaultValue int) int {
+	if s == "" {
+		return defaultValue
+	}
+	var v int
+	_, err := fmt.Sscanf(s, "%d", &v)
+	if err != nil || v <= 0 {
+		return defaultValue
+	}
+	return v
+}
+
+func parseMaxBytesParam(s string, defaultValue int64) int64 {
+	if s == "" {
+		return defaultValue
+	}
+	var v int64
+	_, err := fmt.Sscanf(s, "%d", &v)
+	if err != nil || v <= 0 {
+		return defaultValue
+	}
+	return v
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(data)
+}
+
+type fileStatusRequest struct {
+	Path     string `json:"path"`
+	MaxBytes string `json:"max_bytes,omitempty"`
+	MaxLines string `json:"max_lines,omitempty"`
 }
 
 func handleStatusFromFile(w http.ResponseWriter, r *http.Request) {
@@ -196,17 +290,22 @@ func handleStatusFromFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var path string
+	var maxBytesStr string
+	var maxLinesStr string
+
 	if r.Method == http.MethodGet {
 		path = r.URL.Query().Get("path")
+		maxBytesStr = r.URL.Query().Get("max_bytes")
+		maxLinesStr = r.URL.Query().Get("max_lines")
 	} else {
-		var req struct {
-			Path string `json:"path"`
-		}
+		var req fileStatusRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
 			return
 		}
 		path = req.Path
+		maxBytesStr = req.MaxBytes
+		maxLinesStr = req.MaxLines
 	}
 
 	if path == "" {
@@ -214,7 +313,10 @@ func handleStatusFromFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lines, err := readLinesFromFile(path)
+	maxBytes := parseMaxBytesParam(maxBytesStr, DefaultMaxTailBytes)
+	maxLines := parseIntParam(maxLinesStr, DefaultMaxTailLines)
+
+	lines, err := readTailLinesFromFile(path, maxBytes, maxLines)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 		return
@@ -222,11 +324,11 @@ func handleStatusFromFile(w http.ResponseWriter, r *http.Request) {
 
 	status, matchLine := extractStatus(lines)
 
-	message := "Build status extracted successfully"
+	message := "Build status extracted successfully (tail read)"
 	if status == StatusUnknown {
-		message = "Could not determine build status from log"
+		message = "Could not determine build status from log (tail read)"
 	} else if status == StatusRunning {
-		message = "Build appears to be still running"
+		message = "Build appears to be still running (tail read)"
 	}
 
 	writeJSON(w, http.StatusOK, StatusResponse{
@@ -238,6 +340,11 @@ func handleStatusFromFile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type urlStatusRequest struct {
+	URL      string `json:"url"`
+	MaxLines string `json:"max_lines,omitempty"`
+}
+
 func handleStatusFromURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
@@ -245,17 +352,19 @@ func handleStatusFromURL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var rawURL string
+	var maxLinesStr string
+
 	if r.Method == http.MethodGet {
 		rawURL = r.URL.Query().Get("url")
+		maxLinesStr = r.URL.Query().Get("max_lines")
 	} else {
-		var req struct {
-			URL string `json:"url"`
-		}
+		var req urlStatusRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
 			return
 		}
 		rawURL = req.URL
+		maxLinesStr = req.MaxLines
 	}
 
 	if rawURL == "" {
@@ -263,7 +372,9 @@ func handleStatusFromURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lines, err := readLinesFromURL(rawURL)
+	maxLines := parseIntParam(maxLinesStr, DefaultMaxTailLines)
+
+	lines, err := readTailLinesFromURL(rawURL, maxLines)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 		return
@@ -271,11 +382,11 @@ func handleStatusFromURL(w http.ResponseWriter, r *http.Request) {
 
 	status, matchLine := extractStatus(lines)
 
-	message := "Build status extracted successfully"
+	message := "Build status extracted successfully (stream tail read)"
 	if status == StatusUnknown {
-		message = "Could not determine build status from log"
+		message = "Could not determine build status from log (stream tail read)"
 	} else if status == StatusRunning {
-		message = "Build appears to be still running"
+		message = "Build appears to be still running (stream tail read)"
 	}
 
 	writeJSON(w, http.StatusOK, StatusResponse{
